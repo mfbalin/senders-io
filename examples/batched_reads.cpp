@@ -1,4 +1,5 @@
 #include <sio/io_uring/file_handle.hpp>
+#include <sio/io_uring/mt_io_uring_context.hpp>
 #include <sio/read_batched.hpp>
 #include <sio/sequence/reduce.hpp>
 #include <sio/sequence/iterate.hpp>
@@ -186,10 +187,11 @@ struct program_options {
         {    "help",       no_argument, 0, 'h'},
         {    "seed", required_argument, 0, 'r'},
         { "threads", required_argument, 0, 't'},
+        {     "exp",       no_argument, 0, 'e'},
         {         0,                 0, 0,   0}
       };
 
-      const char* short_options = "b:s:m:hr:t:";
+      const char* short_options = "b:s:m:hr:t:e:";
 
       c = getopt_long(argc, argv, short_options, long_options, &option_index);
       if (c == -1)
@@ -209,6 +211,10 @@ struct program_options {
 
       case 'r':
         seed = std::stoi(optarg);
+        break;
+      
+      case 'e':
+        exp = true;
         break;
 
       case 's': {
@@ -299,6 +305,7 @@ Report Bugs:
   std::vector<file_options> files{};
   bool buffered = false;
   std::size_t memsize = 1 << 20;
+  bool exp = false;
 };
 
 struct thread_state {
@@ -483,21 +490,72 @@ int main(int argc, char* argv[]) {
   // libc++ has no jthread yet
   std::vector<std::thread> threads{};
   counters statistics{options.nthreads};
-  int n_files_per_thread = options.files.size() / options.nthreads;
-  if (n_files_per_thread < 1) {
-    throw std::runtime_error{"Not enough files for the number of threads"};
-  }
-  std::size_t n_bytes_per_thread = options.n_total_bytes / options.nthreads;
-  n_bytes_per_thread += (options.block_size - n_bytes_per_thread % options.block_size);
-  for (int i = 0; i < options.nthreads; ++i) {
-    std::span<const file_options> files{options.files};
-    if (i == options.nthreads - 1) {
-      files = files.subspan(i * n_files_per_thread);
-    } else {
-      files = files.subspan(i * n_files_per_thread, n_files_per_thread);
+  if (options.exp) {
+    auto ctx = std::make_unique<sio::io_uring::mt_io_uring_context>(options.nthreads, options.submission_queue_length);
+    if (options.files.empty()) {
+      throw std::runtime_error{"No file was provided"};
     }
-    threads.emplace_back(
-      run_io_uring, i, std::ref(options), files, n_bytes_per_thread, std::ref(statistics));
+    auto file = options.files[0];
+    uint32_t flags = O_RDONLY | (options.buffered ? 0 : O_DIRECT);
+    auto [file_id, fd] = ctx->open_file(file.path, flags);
+    using stat_type = struct ::stat;
+    stat_type st{};
+    std::size_t num_blocks, file_size;
+    throw_errno_if(::fstat(fd, &st) == -1, "Calling fstat failed");
+    if (S_ISBLK(st.st_mode)) {
+      std::uint64_t n_bytes = 0;
+      throw_errno_if(
+        ::ioctl(fd, BLKGETSIZE64, &n_bytes) == -1, "Calling ioctl with BLKGETSIZE64 failed");
+      file_size = n_bytes;
+      num_blocks = n_bytes / options.block_size;
+    } else if (S_ISREG(st.st_mode)) {
+      file_size = st.st_size;
+      num_blocks = st.st_size / options.block_size;
+    } else {
+      throw std::runtime_error{"Unsupported file type"};
+    }
+    std::mt19937_64 rng{1000000007};
+    std::vector<std::span<std::byte>> buffers{};
+    std::vector<::off_t> offsets{};
+    // Allocate buffers and offsets
+    std::size_t read_num_blocks = options.n_total_bytes / options.block_size;
+    auto buffer_storage = make_unique_aligned(read_num_blocks * options.block_size, options.block_size);
+    std::byte* buffer_data = buffer_storage.get();
+    buffers.reserve(read_num_blocks);
+    offsets.reserve(read_num_blocks);
+    std::uniform_int_distribution<std::size_t> off_dist(0, num_blocks - 1);
+    for (std::size_t i = 0; i < read_num_blocks; i++) {
+      buffers.push_back(
+        std::as_writable_bytes(std::span{buffer_data + i * options.block_size, options.block_size}));
+      offsets.push_back(off_dist(rng) * options.block_size);
+    }
+    threads.emplace_back([file_id, &stats=statistics, &options, ctx_=std::move(ctx), buffers_=std::move(buffers), offsets_=std::move(offsets), buffer_storage_=std::move(buffer_storage)]() mutable {
+      auto sndr = ctx_->read_batched(file_id, buffers_, offsets_);
+      stdexec::sync_wait(sndr);
+      stats.n_bytes_read[0].fetch_add(options.n_total_bytes, std::memory_order_relaxed);
+      stats.n_io_ops[0].fetch_add(options.n_total_bytes / options.block_size, std::memory_order_relaxed);
+      std::scoped_lock lock{stats.mtx};
+      stats.n_completions += options.nthreads;
+      stats.cv.notify_one();
+    });
+  }
+  else {
+    int n_files_per_thread = options.files.size() / options.nthreads;
+    if (n_files_per_thread < 1) {
+      throw std::runtime_error{"Not enough files for the number of threads"};
+    }
+    std::size_t n_bytes_per_thread = options.n_total_bytes / options.nthreads;
+    n_bytes_per_thread += (options.block_size - n_bytes_per_thread % options.block_size);
+    for (int i = 0; i < options.nthreads; ++i) {
+      std::span<const file_options> files{options.files};
+      if (i == options.nthreads - 1) {
+        files = files.subspan(i * n_files_per_thread);
+      } else {
+        files = files.subspan(i * n_files_per_thread, n_files_per_thread);
+      }
+      threads.emplace_back(
+        run_io_uring, i, std::ref(options), files, n_bytes_per_thread, std::ref(statistics));
+    }
   }
 
   print_statistics(options, statistics);
